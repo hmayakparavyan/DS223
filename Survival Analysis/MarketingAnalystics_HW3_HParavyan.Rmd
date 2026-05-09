@@ -1,0 +1,223 @@
+---
+title: "Marketing Analytics | Homework 3"
+author: "Hmayak Paravyan"
+date: "2026-05-09"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(survival)
+library(flexsurv)
+library(dplyr)
+library(ggplot2)
+library(broom)
+```
+```{r data}
+df <- read.csv("telco.csv")
+head(df)
+```
+```{r data-preprocessing}
+df$churn_event <- ifelse(df$churn == "Yes" | df$churn == 1, 1, 0)
+
+df <- df %>%
+  mutate(
+    marital = as.factor(marital),
+    retire = as.factor(retire),
+    gender = as.factor(gender),
+    voice = as.factor(voice),
+    internet = as.factor(internet),
+    forward = as.factor(forward),
+    custcat = as.factor(custcat),
+    ed = as.factor(ed),
+    region = as.factor(region)
+  )
+```
+
+```{r AFT Model}
+surv_obj <- Surv(time = df$tenure, event = df$churn_event)
+
+formula_full <- surv_obj ~ region + age + marital + address + income + ed +
+  retire + gender + voice + internet + forward + custcat
+
+models <- list(
+  exponential = flexsurvreg(formula_full, data = df, dist = "exponential"),
+  weibull = flexsurvreg(formula_full, data = df, dist = "weibull"),
+  lognormal = flexsurvreg(formula_full, data = df, dist = "lognormal"),
+  loglogistic = flexsurvreg(formula_full, data = df, dist = "llogis"),
+  gamma = flexsurvreg(formula_full, data = df, dist = "gamma"),
+  gengamma = flexsurvreg(formula_full, data = df, dist = "gengamma")
+)
+
+comparison <- data.frame(
+  Model = names(models),
+  AIC = sapply(models, AIC),
+  BIC = sapply(models, BIC),
+  LogLik = sapply(models, function(x) x$loglik)
+)
+
+comparison
+```
+```{r best model}
+best_model <- models$lognormal
+
+best_model$res
+```
+```{r final}
+final_model <- flexsurvreg(
+  surv_obj ~ age + marital + address + voice + internet + custcat,
+  data = df,
+  dist = "lognormal"
+)
+
+final_model$res
+```
+
+```{r comparison}
+comparison_final <- data.frame(
+  Model = c("Full lognormal", "Final lognormal"),
+  AIC = c(AIC(best_model), AIC(final_model)),
+  BIC = c(BIC(best_model), BIC(final_model)),
+  LogLik = c(best_model$loglik, final_model$loglik)
+)
+
+comparison_final
+```
+
+Although the full model has a slightly higher log-likelihood, the final lognormal model has lower AIC and BIC values. This means it gives a better balance between model fit and simplicity. Therefore, the final lognormal model is selected for interpretation, survival prediction, and CLV calculation.
+
+```{r survival-curve-visualization}
+newdata <- df %>%
+  group_by(custcat) %>%
+  summarise(
+    age = mean(age, na.rm = TRUE),
+    marital = names(sort(table(marital), decreasing = TRUE))[1],
+    address = mean(address, na.rm = TRUE),
+    voice = names(sort(table(voice), decreasing = TRUE))[1],
+    internet = names(sort(table(internet), decreasing = TRUE))[1],
+    .groups = "drop"
+  )
+
+plot(
+  final_model,
+  newdata = newdata,
+  ci = FALSE,
+  xlab = "Tenure",
+  ylab = "Survival Probability",
+  main = "Survival Curves by Customer Category"
+)
+
+legend(
+  "bottomleft",
+  legend = newdata$custcat,
+  col = 1:nrow(newdata),
+  lty = 1:nrow(newdata),
+  bty = "n"
+)
+```
+
+The survival curves show how the probability of remaining a customer changes over tenure for different customer categories. Customer categories with higher curves have better retention and lower churn risk. Categories with lower curves lose customers faster and should be prioritized for retention actions.
+
+```{r customer-lifetime-value}
+
+monthly_margin <- 30
+discount_rate <- 0.01
+months <- 1:12
+
+df$predicted_clv <- apply(df, 1, function(row) {
+
+  customer <- as.data.frame(t(row))
+
+  customer$marital <- factor(customer$marital, levels = levels(df$marital))
+  customer$voice <- factor(customer$voice, levels = levels(df$voice))
+  customer$internet <- factor(customer$internet, levels = levels(df$internet))
+  customer$custcat <- factor(customer$custcat, levels = levels(df$custcat))
+
+  customer$age <- as.numeric(customer$age)
+  customer$address <- as.numeric(customer$address)
+
+  surv_probs <- summary(
+    final_model,
+    newdata = customer,
+    type = "survival",
+    t = as.numeric(row["tenure"]) + months
+  )[[1]]$est
+
+  sum(monthly_margin * surv_probs / ((1 + discount_rate)^months))
+})
+
+summary(df$predicted_clv)
+```
+
+```{r clv-by-segments}
+
+clv_by_custcat <- df %>%
+  group_by(custcat) %>%
+  summarise(
+    customers = n(),
+    avg_clv = mean(predicted_clv, na.rm = TRUE),
+    median_clv = median(predicted_clv, na.rm = TRUE),
+    min_clv = min(predicted_clv, na.rm = TRUE),
+    max_clv = max(predicted_clv, na.rm = TRUE)
+  ) %>%
+  arrange(desc(avg_clv))
+
+clv_by_custcat
+```
+
+```{r retention-budget}
+
+df$survival_12_months <- apply(df, 1, function(row) {
+
+  customer <- as.data.frame(t(row))
+
+  customer$marital <- factor(customer$marital, levels = levels(df$marital))
+  customer$voice <- factor(customer$voice, levels = levels(df$voice))
+  customer$internet <- factor(customer$internet, levels = levels(df$internet))
+  customer$custcat <- factor(customer$custcat, levels = levels(df$custcat))
+
+  customer$age <- as.numeric(customer$age)
+  customer$address <- as.numeric(customer$address)
+
+  summary(
+    final_model,
+    newdata = customer,
+    type = "survival",
+    t = as.numeric(row["tenure"]) + 12
+  )[[1]]$est
+})
+
+df$churn_risk_12_months <- 1 - df$survival_12_months
+
+at_risk_customers <- df %>%
+  filter(churn_risk_12_months > 0.30)
+
+annual_retention_budget <- sum(at_risk_customers$predicted_clv, na.rm = TRUE) * 0.20
+
+nrow(at_risk_customers)
+annual_retention_budget
+
+```
+
+Based on average CLV, Plus service customers are the most valuable segment, followed by E-service customers. I define valuable customers as those with higher expected future value and stronger survival probability. Basic service and Total service customers have lower average CLV, so retention actions should be more selective for them.
+
+Using a 30% one-year churn-risk threshold, 458 customers are considered at risk. If the company allocates 20% of the predicted CLV of these at-risk customers for retention, the estimated annual retention budget would be 17,696.28. This budget can be used for targeted offers, loyalty discounts, service improvements, and personalized retention campaigns.
+
+```{r clv-segment-visualization}
+ggplot(clv_by_custcat, aes(x = reorder(custcat, avg_clv), y = avg_clv)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Average CLV by Customer Category",
+    x = "Customer Category",
+    y = "Average CLV"
+  ) +
+  theme_minimal()
+```
+
+The survival analysis showed that the lognormal Accelerated Failure Time (AFT) model provided the best balance between model fit and model simplicity. After removing non-significant variables, the final model showed that age and address stability increase expected customer lifetime, while unmarried customers, voice users, and internet users tend to churn earlier. Customer category was also an important predictor, with Plus service and E-service customers having longer expected tenure and higher predicted customer lifetime value (CLV).
+
+The CLV analysis identified Plus service customers as the most valuable segment, with the highest average predicted CLV. Using the estimated one-year survival probabilities, 458 customers were identified as at-risk subscribers. Assuming the company allocates 20% of the at-risk customers’ predicted CLV toward retention activities, the estimated annual retention budget would be approximately 17,696. Besides financial incentives, retention strategies should include personalized offers, loyalty programs, improved customer support, and targeted campaigns for high-risk customers with high expected lifetime value.
